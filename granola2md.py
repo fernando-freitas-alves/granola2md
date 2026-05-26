@@ -3,11 +3,15 @@
 granola2md.py - Export Granola meeting notes to Markdown files.
 
 Usage:
-    python3 granola2md.py [output_dir]
+    python3 granola2md.py [--yes] [output_dir]
+
+Options:
+    --yes, -y   Auto-approve all updates without prompting
 
 If output_dir is not provided, notes are saved to ./notes/
 """
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +31,7 @@ GRANOLA_APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Granola
 SUPABASE_JSON = GRANOLA_APP_SUPPORT / "supabase.json"
 API_BASE = "https://api.granola.ai/v1"
 AUTH_BASE = "https://auth.granola.ai/user_management"
+STATE_FILENAME = ".granola2md_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +58,6 @@ def refresh_token(tokens: dict) -> dict:
     print("Refreshing access token...")
 
     # Read client_id from the stored token's iss claim (JWT)
-    # iss = "https://auth.granola.ai/user_management/client_01JZJ0XBDAT8PHJWQY09Y0VD61"
     iss = _decode_jwt_payload(tokens["access_token"]).get("iss", "")
     client_id = iss.split("/")[-1] if "/" in iss else ""
 
@@ -140,6 +144,25 @@ def get_documents(token: str) -> list[dict]:
 
 def get_document_panels(doc_id: str, token: str) -> list[dict]:
     return api_post("get-document-panels", token, {"document_id": doc_id})
+
+
+def get_transcript(doc_id: str, token: str, debug: bool = False) -> list[dict]:
+    """Fetch transcript segments for a document. Returns [] if unavailable."""
+    try:
+        result = api_post("get-document-transcript", token, {"document_id": doc_id})
+    except urllib.error.HTTPError as e:
+        if debug:
+            print(f"    [debug] get-document-transcript HTTP {e.code}")
+        return []
+    except Exception as e:
+        if debug:
+            print(f"    [debug] get-document-transcript error: {e}")
+        return []
+
+    if isinstance(result, list):
+        # Keep only final segments
+        return [s for s in result if s.get("is_final", True)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -450,14 +473,187 @@ def build_note(doc: dict, panels: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Transcript builder
+# ---------------------------------------------------------------------------
+
+def _format_timestamp(seconds: float) -> str:
+    """Format seconds as H:MM:SS or M:SS."""
+    s = int(seconds)
+    h, remainder = divmod(s, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def build_transcript(doc: dict, segments: list[dict]) -> str:
+    """Build a transcript Markdown file from raw transcript segments."""
+    if not segments:
+        return ""
+
+    title = doc.get("title") or "Untitled"
+    date = extract_meeting_date(doc)
+    meeting_time = extract_meeting_time(doc)
+
+    # "microphone" = the note-taker; "system" = other participants
+    people = doc.get("people") or {}
+    creator_name = (people.get("creator") or {}).get("name") or "Me"
+
+    # Meeting start for computing relative timestamps
+    cal = doc.get("google_calendar_event") or {}
+    start_str = (cal.get("start") or {}).get("dateTime") or doc.get("created_at") or ""
+    try:
+        meeting_start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+    except Exception:
+        meeting_start = None
+
+    def speaker_label(seg: dict) -> str:
+        detected = seg.get("detected_speaker_name")
+        if detected:
+            return detected
+        return creator_name if seg.get("source") == "microphone" else "Others"
+
+    def rel_ts(seg: dict) -> str | None:
+        if not meeting_start:
+            return None
+        try:
+            seg_dt = datetime.fromisoformat(seg["start_timestamp"].replace("Z", "+00:00"))
+            elapsed = max(0.0, (seg_dt - meeting_start).total_seconds())
+            return _format_timestamp(elapsed)
+        except Exception:
+            return None
+
+    # Group consecutive segments from the same speaker
+    groups: list[tuple[str, list[dict]]] = []
+    for seg in segments:
+        label = speaker_label(seg)
+        if groups and groups[-1][0] == label:
+            groups[-1][1].append(seg)
+        else:
+            groups.append((label, [seg]))
+
+    lines = ["---"]
+    lines.append(f"title: {json.dumps(title)}")
+    lines.append(f"date: {date}")
+    if meeting_time:
+        lines.append(f"time: {meeting_time}")
+    lines.append(f"source: granola")
+    lines.append(f"granola_id: {doc['id']}")
+    lines.append(f"type: transcript")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {title} — Transcript")
+    lines.append("")
+
+    for speaker, group_segs in groups:
+        ts = rel_ts(group_segs[0])
+        ts_str = f" *({ts})*" if ts else ""
+        lines.append(f"**{speaker}**{ts_str}")
+        text = " ".join(s["text"].strip() for s in group_segs if s.get("text", "").strip())
+        if text:
+            lines.append(text)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+
+def load_state(output_dir: Path) -> dict:
+    state_file = output_dir / STATE_FILENAME
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(output_dir: Path, state: dict) -> None:
+    state_file = output_dir / STATE_FILENAME
+    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def read_frontmatter_id(filepath: Path) -> str | None:
+    """Read granola_id from YAML frontmatter of an existing note file."""
+    try:
+        text = filepath.read_text(encoding="utf-8")
+        match = re.search(r"^granola_id:\s*(\S+)", text, re.MULTILINE)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+def find_file_for_doc(
+    output_dir: Path,
+    doc_id: str,
+    date: str,
+    safe_title: str,
+    suffix: str = "",
+) -> tuple[Path, bool]:
+    """
+    Find the right filepath for this document.
+
+    suffix is appended before .md, e.g. ".transcript" → "2026-01-01 - Title.transcript.md"
+
+    Returns (filepath, already_exists_for_this_doc).
+    already_exists_for_this_doc=True means we found an existing file whose granola_id matches.
+    """
+    ext = f"{suffix}.md"
+    base = f"{date} - {safe_title}{ext}"
+    candidates = [base] + [f"{date} - {safe_title} ({i}){ext}" for i in range(1, 200)]
+
+    for candidate in candidates:
+        filepath = output_dir / candidate
+        if not filepath.exists():
+            return filepath, False
+        existing_id = read_frontmatter_id(filepath)
+        if existing_id == doc_id:
+            return filepath, True
+        # File exists but belongs to a different doc — keep searching
+
+    # Extremely unlikely fallback
+    import uuid
+    return output_dir / f"{date} - {safe_title}-{uuid.uuid4().hex[:6]}{ext}", False
+
+
+# ---------------------------------------------------------------------------
+# Interactive update prompt
+# ---------------------------------------------------------------------------
+
+def prompt_update(label: str, filename: str, old_size: int, new_size: int) -> bool:
+    """Ask user whether to update a changed file. Returns True to update."""
+    delta = new_size - old_size
+    sign = "+" if delta >= 0 else ""
+    print(f"    {label} changed: {filename}  ({old_size} → {new_size} bytes, {sign}{delta})")
+    try:
+        answer = input("    Update? [y/N]: ").strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    output_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("notes")
+    auto_yes = "--yes" in sys.argv or "-y" in sys.argv
+    debug = "--debug" in sys.argv
+    pos_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    output_dir = Path(pos_args[0]) if pos_args else Path("notes")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Output directory: {output_dir.resolve()}")
+
+    state = load_state(output_dir)
 
     token = get_access_token()
     print("Fetching documents...")
@@ -473,6 +669,7 @@ def main():
     print(f"Found {len(active_docs)} active documents (out of {len(docs)} total).")
 
     saved = 0
+    updated = 0
     skipped = 0
 
     for doc in active_docs:
@@ -485,13 +682,21 @@ def main():
         try:
             panels = get_document_panels(doc_id, token)
         except urllib.error.HTTPError as e:
-            print(f"    Warning: could not fetch panels for {doc_id}: {e.code}")
+            print(f"    Warning: could not fetch panels: {e.code}")
             panels = []
         except Exception as e:
-            print(f"    Warning: error fetching panels for {doc_id}: {e}")
+            print(f"    Warning: error fetching panels: {e}")
             panels = []
 
-        # Skip if there's no content at all
+        try:
+            transcript_segments = get_transcript(doc_id, token, debug=debug)
+        except Exception as e:
+            print(f"    Warning: error fetching transcript: {e}")
+            transcript_segments = []
+
+        if debug:
+            print(f"    [debug] transcript_segments: {len(transcript_segments)}")
+
         has_panel_content = any(p.get("content") for p in panels)
         has_notes_content = bool(doc.get("notes_plain") or doc.get("notes_markdown"))
 
@@ -501,25 +706,154 @@ def main():
             continue
 
         note_content = build_note(doc, panels)
+        note_hash = content_hash(note_content)
 
-        # Generate filename: YYYY-MM-DD - Safe-Title.md
+        transcript_content = build_transcript(doc, transcript_segments) if transcript_segments else None
+        transcript_hash = content_hash(transcript_content) if transcript_content else None
+
         safe_title = make_safe_filename(title)
-        filename = f"{date} - {safe_title}.md"
-        filepath = output_dir / filename
+        state_entry = state.get(doc_id)
 
-        # Handle duplicate filenames by appending a counter
-        if filepath.exists():
-            counter = 1
-            while filepath.exists():
-                filename = f"{date} - {safe_title} ({counter}).md"
-                filepath = output_dir / filename
-                counter += 1
+        if state_entry:
+            # Known document — check for content changes
+            notes_changed = note_hash != state_entry.get("notes_hash")
+            transcript_changed = (
+                transcript_content is not None
+                and transcript_hash != state_entry.get("transcript_hash")
+            )
 
-        filepath.write_text(note_content, encoding="utf-8")
-        print(f"    Saved: {filename}")
-        saved += 1
+            if not notes_changed and not transcript_changed:
+                print(f"    Unchanged: {state_entry['notes_file']}")
+                skipped += 1
+                continue
 
-    print(f"\nDone. {saved} notes saved, {skipped} skipped.")
+            doc_updated = False
+
+            if notes_changed:
+                notes_file = state_entry["notes_file"]
+                notes_filepath = output_dir / notes_file
+                old_size = notes_filepath.stat().st_size if notes_filepath.exists() else 0
+                do_update = auto_yes or prompt_update(
+                    "Notes", notes_file, old_size, len(note_content.encode())
+                )
+                if do_update:
+                    notes_filepath.write_text(note_content, encoding="utf-8")
+                    state_entry["notes_hash"] = note_hash
+                    print(f"    Updated notes: {notes_file}")
+                    doc_updated = True
+
+            if transcript_changed:
+                transcript_file = state_entry.get("transcript_file")
+                if not transcript_file:
+                    # Transcript wasn't saved before — find a filename for it
+                    tf_path, _ = find_file_for_doc(
+                        output_dir, doc_id, date, safe_title, ".transcript"
+                    )
+                    transcript_file = tf_path.name
+
+                tf_path = output_dir / transcript_file
+                old_size = tf_path.stat().st_size if tf_path.exists() else 0
+                do_update = auto_yes or prompt_update(
+                    "Transcript", transcript_file, old_size, len(transcript_content.encode())
+                )
+                if do_update:
+                    tf_path.write_text(transcript_content, encoding="utf-8")
+                    state_entry["transcript_file"] = transcript_file
+                    state_entry["transcript_hash"] = transcript_hash
+                    print(f"    Updated transcript: {transcript_file}")
+                    doc_updated = True
+
+            state[doc_id] = state_entry
+            if doc_updated:
+                updated += 1
+            else:
+                skipped += 1
+
+        else:
+            # New document (or first run after adding state tracking)
+            notes_filepath, notes_existed = find_file_for_doc(
+                output_dir, doc_id, date, safe_title
+            )
+            notes_filename = notes_filepath.name
+
+            if notes_existed:
+                # Migration: file was written by an earlier run without state tracking
+                existing_hash = content_hash(notes_filepath.read_text(encoding="utf-8"))
+                if existing_hash == note_hash:
+                    print(f"    Adopted (unchanged): {notes_filename}")
+                    state_entry = {
+                        "notes_file": notes_filename,
+                        "notes_hash": note_hash,
+                        "title": title,
+                        "date": date,
+                    }
+                    skipped += 1
+                else:
+                    old_size = notes_filepath.stat().st_size
+                    do_update = auto_yes or prompt_update(
+                        "Notes (migrated)", notes_filename,
+                        old_size, len(note_content.encode())
+                    )
+                    if do_update:
+                        notes_filepath.write_text(note_content, encoding="utf-8")
+                        print(f"    Updated notes (migrated): {notes_filename}")
+                        updated += 1
+                    else:
+                        # Keep whatever was on disk; store its hash
+                        note_hash = content_hash(notes_filepath.read_text(encoding="utf-8"))
+                        skipped += 1
+                    state_entry = {
+                        "notes_file": notes_filename,
+                        "notes_hash": note_hash,
+                        "title": title,
+                        "date": date,
+                    }
+            else:
+                notes_filepath.write_text(note_content, encoding="utf-8")
+                print(f"    Saved notes: {notes_filename}")
+                state_entry = {
+                    "notes_file": notes_filename,
+                    "notes_hash": note_hash,
+                    "title": title,
+                    "date": date,
+                }
+                saved += 1
+
+            # Handle transcript for new/migrated document
+            if transcript_content:
+                tf_path, tf_existed = find_file_for_doc(
+                    output_dir, doc_id, date, safe_title, ".transcript"
+                )
+                transcript_filename = tf_path.name
+
+                if tf_existed:
+                    existing_hash = content_hash(tf_path.read_text(encoding="utf-8"))
+                    if existing_hash == transcript_hash:
+                        print(f"    Adopted transcript (unchanged): {transcript_filename}")
+                        state_entry["transcript_file"] = transcript_filename
+                        state_entry["transcript_hash"] = transcript_hash
+                    else:
+                        old_size = tf_path.stat().st_size
+                        do_update = auto_yes or prompt_update(
+                            "Transcript (migrated)", transcript_filename,
+                            old_size, len(transcript_content.encode())
+                        )
+                        if do_update:
+                            tf_path.write_text(transcript_content, encoding="utf-8")
+                            print(f"    Updated transcript (migrated): {transcript_filename}")
+                        final_hash = content_hash(tf_path.read_text(encoding="utf-8"))
+                        state_entry["transcript_file"] = transcript_filename
+                        state_entry["transcript_hash"] = final_hash
+                else:
+                    tf_path.write_text(transcript_content, encoding="utf-8")
+                    print(f"    Saved transcript: {transcript_filename}")
+                    state_entry["transcript_file"] = transcript_filename
+                    state_entry["transcript_hash"] = transcript_hash
+
+            state[doc_id] = state_entry
+
+    save_state(output_dir, state)
+    print(f"\nDone. {saved} saved, {updated} updated, {skipped} skipped.")
 
 
 if __name__ == "__main__":
