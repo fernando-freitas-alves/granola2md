@@ -39,17 +39,84 @@ STATE_FILENAME = ".granola2md_state.json"
 # ---------------------------------------------------------------------------
 
 def load_tokens() -> dict:
+    """Load auth tokens, preferring the encrypted file when it's newer."""
+    enc_file = SUPABASE_JSON.parent / "supabase.json.enc"
+    plain_mtime = SUPABASE_JSON.stat().st_mtime if SUPABASE_JSON.exists() else 0
+    enc_mtime = enc_file.stat().st_mtime if enc_file.exists() else 0
+
+    if enc_mtime > plain_mtime:
+        tokens = _load_tokens_from_enc(enc_file)
+        if tokens:
+            # Write back to plain file so the next run is instant
+            try:
+                with open(SUPABASE_JSON) as f:
+                    data = json.load(f)
+                data["workos_tokens"] = json.dumps(tokens)
+                with open(SUPABASE_JSON, "w") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+            return tokens
+
     with open(SUPABASE_JSON) as f:
         data = json.load(f)
-    tokens = json.loads(data["workos_tokens"])
-    return tokens
+    return json.loads(data["workos_tokens"])
+
+
+def _load_tokens_from_enc(enc_file: Path) -> dict | None:
+    """Decrypt supabase.json.enc via macOS Keychain → storage.dek → AES-256-GCM."""
+    import base64, subprocess, tempfile, os
+
+    dek_file = enc_file.parent / "storage.dek"
+    if not dek_file.exists():
+        return None
+
+    # Retrieve Electron safeStorage key from macOS Keychain
+    try:
+        kc_pw = subprocess.check_output(
+            ["security", "find-generic-password",
+             "-s", "Granola Safe Storage", "-a", "Granola Key", "-w"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return None
+
+    # Decrypt storage.dek: v10 prefix + AES-128-CBC (PBKDF2 key, space IV)
+    dek_raw = dek_file.read_bytes()
+    if not dek_raw.startswith(b"v10"):
+        return None
+    key = hashlib.pbkdf2_hmac("sha1", kc_pw.encode(), b"saltysalt", 1003, 16)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+        f.write(dek_raw[3:]); tmp = f.name
+    try:
+        r = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-128-cbc",
+             "-K", key.hex(), "-iv", "20" * 16, "-nopad", "-in", tmp],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            return None
+        pad = r.stdout[-1]
+        dek = base64.b64decode(r.stdout[:-pad])
+    finally:
+        os.unlink(tmp)
+
+    # Decrypt supabase.json.enc: 12-byte IV + ciphertext + 16-byte GCM tag
+    enc_data = enc_file.read_bytes()
+    iv, tag, ct = enc_data[:12], enc_data[-16:], enc_data[12:-16]
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        plaintext = AESGCM(dek).decrypt(iv, ct + tag, None)
+    except ImportError:
+        return None
+    data = json.loads(plaintext)
+    return json.loads(data["workos_tokens"])
 
 
 def is_token_expired(tokens: dict) -> bool:
     obtained_at_ms = tokens.get("obtained_at", 0)
-    expires_in_s = tokens.get("expires_in", 0)
+    expires_in_s = tokens.get("expires_in") or 0  # handle None
     now_ms = int(time.time() * 1000)
-    # Refresh 5 minutes before actual expiry
     return (now_ms - obtained_at_ms) / 1000 > (expires_in_s - 300)
 
 
