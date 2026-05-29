@@ -63,15 +63,13 @@ def load_tokens() -> dict:
     return json.loads(data["workos_tokens"])
 
 
-def _load_tokens_from_enc(enc_file: Path) -> dict | None:
-    """Decrypt supabase.json.enc via macOS Keychain → storage.dek → AES-256-GCM."""
+def _decrypt_granola_enc(enc_file: Path) -> bytes | None:
+    """Decrypt a Granola .enc file via macOS Keychain → storage.dek → AES-256-GCM. Returns raw bytes."""
     import base64, subprocess, tempfile, os
 
     dek_file = enc_file.parent / "storage.dek"
     if not dek_file.exists():
         return None
-
-    # Retrieve Electron safeStorage key from macOS Keychain
     try:
         kc_pw = subprocess.check_output(
             ["security", "find-generic-password",
@@ -81,7 +79,6 @@ def _load_tokens_from_enc(enc_file: Path) -> dict | None:
     except Exception:
         return None
 
-    # Decrypt storage.dek: v10 prefix + AES-128-CBC (PBKDF2 key, space IV)
     dek_raw = dek_file.read_bytes()
     if not dek_raw.startswith(b"v10"):
         return None
@@ -101,16 +98,51 @@ def _load_tokens_from_enc(enc_file: Path) -> dict | None:
     finally:
         os.unlink(tmp)
 
-    # Decrypt supabase.json.enc: 12-byte IV + ciphertext + 16-byte GCM tag
     enc_data = enc_file.read_bytes()
     iv, tag, ct = enc_data[:12], enc_data[-16:], enc_data[12:-16]
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        plaintext = AESGCM(dek).decrypt(iv, ct + tag, None)
+        return AESGCM(dek).decrypt(iv, ct + tag, None)
     except ImportError:
+        return None
+
+
+def _load_tokens_from_enc(enc_file: Path) -> dict | None:
+    """Decrypt supabase.json.enc and return parsed workos_tokens."""
+    plaintext = _decrypt_granola_enc(enc_file)
+    if plaintext is None:
         return None
     data = json.loads(plaintext)
     return json.loads(data["workos_tokens"])
+
+
+def load_doc_spaces() -> dict[str, list[str]]:
+    """Return a mapping of doc_id → [space_name, ...] from the local Granola cache."""
+    cache_enc = GRANOLA_APP_SUPPORT / "cache-v6.json.enc"
+    if not cache_enc.exists():
+        return {}
+    plaintext = _decrypt_granola_enc(cache_enc)
+    if not plaintext:
+        return {}
+    try:
+        state = json.loads(plaintext)["cache"]["state"]
+        meta = state.get("documentListsMetadata") or {}
+        lists = state.get("documentLists") or {}
+    except Exception:
+        return {}
+
+    # Build reverse map: doc_id → space names (skip deleted spaces)
+    doc_to_spaces: dict[str, list[str]] = {}
+    for list_id, doc_ids in lists.items():
+        info = meta.get(list_id)
+        if not info or info.get("deleted_at"):
+            continue
+        name = info.get("title", "").strip()
+        if not name:
+            continue
+        for doc_id in doc_ids:
+            doc_to_spaces.setdefault(doc_id, []).append(name)
+    return doc_to_spaces
 
 
 def is_token_expired(tokens: dict) -> bool:
@@ -211,6 +243,35 @@ def get_documents(token: str) -> list[dict]:
 
 def get_document_panels(doc_id: str, token: str) -> list[dict]:
     return api_post("get-document-panels", token, {"document_id": doc_id})
+
+
+def download_attachments(attachments: list[dict], att_dir: Path) -> list[dict]:
+    """Download image attachments into att_dir; skip files already on disk. Returns list of saved items."""
+    if not attachments:
+        return []
+    att_dir.mkdir(parents=True, exist_ok=True)
+    result = []
+    for att in attachments:
+        if att.get("type") != "image":
+            continue
+        att_id = att["id"]
+        url = att["url"]
+        existing = next(att_dir.glob(f"{att_id}.*"), None)
+        if existing:
+            result.append({"id": att_id, "filename": existing.name, "width": att.get("width", 0), "height": att.get("height", 0)})
+            continue
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "granola2md/1.0"})
+            with urllib.request.urlopen(req) as resp:
+                ct = resp.headers.get("Content-Type", "image/png").split(";")[0].strip().lower()
+                ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}.get(ct, ".png")
+                data = resp.read()
+            local = att_dir / f"{att_id}{ext}"
+            local.write_bytes(data)
+            result.append({"id": att_id, "filename": local.name, "width": att.get("width", 0), "height": att.get("height", 0)})
+        except Exception as e:
+            print(f"    Warning: could not download attachment {att_id}: {e}")
+    return result
 
 
 def get_transcript(doc_id: str, token: str, debug: bool = False) -> list[dict]:
@@ -475,7 +536,7 @@ def make_safe_filename(title: str) -> str:
 # Note builder
 # ---------------------------------------------------------------------------
 
-def build_note(doc: dict, panels: list[dict]) -> str:
+def build_note(doc: dict, panels: list[dict], attachment_paths: list[dict] = None, spaces: list[str] = None) -> str:
     """Build a complete Markdown note from a document and its panels."""
     title = doc.get("title") or "Untitled"
     date = extract_meeting_date(doc)
@@ -499,6 +560,10 @@ def build_note(doc: dict, panels: list[dict]) -> str:
         lines.append("attendees:")
         for a in attendees:
             lines.append(f"  - {a}")
+    if spaces:
+        lines.append("spaces:")
+        for s in spaces:
+            lines.append(f"  - {json.dumps(s)}")
     lines.append(f"source: granola")
     lines.append(f"granola_id: {doc['id']}")
     if meeting_link:
@@ -535,6 +600,14 @@ def build_note(doc: dict, panels: list[dict]) -> str:
             if md.strip():
                 lines.append(md)
                 lines.append("")
+
+    if attachment_paths:
+        lines.append("## Attachments")
+        lines.append("")
+        for att in attachment_paths:
+            rel = f"attachments/{att['folder']}/{att['filename']}"
+            lines.append(f"![]({rel})")
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -723,6 +796,9 @@ def main():
     state = load_state(output_dir)
 
     token = get_access_token()
+    doc_spaces = load_doc_spaces()
+    if doc_spaces:
+        print(f"Loaded spaces for {len(doc_spaces)} documents from local cache.")
     print("Fetching documents...")
 
     try:
@@ -764,6 +840,15 @@ def main():
         if debug:
             print(f"    [debug] transcript_segments: {len(transcript_segments)}")
 
+        raw_attachments = doc.get("attachments") or []
+        att_folder = f"{extract_meeting_date(doc)} - {make_safe_filename(title)}"
+        att_dir = output_dir / "attachments" / att_folder
+        attachment_paths = download_attachments(raw_attachments, att_dir)
+        for ap in attachment_paths:
+            ap["folder"] = att_folder
+        if attachment_paths:
+            print(f"    Attachments: {len(attachment_paths)} image(s)")
+
         has_panel_content = any(p.get("content") for p in panels)
         has_notes_content = bool(doc.get("notes_plain") or doc.get("notes_markdown"))
 
@@ -772,7 +857,7 @@ def main():
             skipped += 1
             continue
 
-        note_content = build_note(doc, panels)
+        note_content = build_note(doc, panels, attachment_paths, doc_spaces.get(doc_id))
         note_hash = content_hash(note_content)
 
         transcript_content = build_transcript(doc, transcript_segments) if transcript_segments else None
